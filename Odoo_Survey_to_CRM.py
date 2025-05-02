@@ -1,79 +1,124 @@
 if record.state == 'done':
     # Initialize variables
-    email_from = contact_name = False
+    email_from = False
+    contact_name = False
+    survey_title = record.survey_id.title  # Get survey title
     table_lines = [
-        "<table style='width:100%; border-collapse:collapse; margin-top:20px;'>",
-        "<caption style='font-weight:bold; margin-bottom:10px;'>",
-        f"{record.survey_id.title} - {datetime.datetime.now().strftime('%Y-%m-%d')}",
-        "</caption>",
-        "<tr style='background-color:#f2f2f2;'>",
-        "<th style='border:1px solid #ddd; padding:8px;'>Question</th>",
-        "<th style='border:1px solid #ddd; padding:8px;'>Answer</th>",
+        "<div style='margin-bottom:20px;'>",
+        "<h3 style='color:#2c3e50;'>Survey: %s</h3>" % survey_title,  # Added survey title display
+        "<table style='width:100%; border-collapse:collapse; margin-top:10px;'>",
+        "<tr style='background-color: #f2f2f2;'>",
+        "<th style='border: 1px solid #ddd; padding: 8px; text-align: left;'>Question</th>",
+        "<th style='border: 1px solid #ddd; padding: 8px; text-align: left;'>Answer</th>",
         "</tr>"
     ]
-
-    # Process survey responses
+    
+    # Detection patterns
+    email_keywords = ['email', 'e-mail', 'mail']
+    contact_keyphrases = [
+        'contact name one',
+        'contact name',
+        'first name',
+        'contact',
+        'name',
+        'one'
+    ]
+    
+    # Extract survey responses
     for line in record.user_input_line_ids:
         if line.question_id and line.display_name:
             question = line.question_id.title.strip()
             answer = line.display_name.strip()
+            question_lower = question.lower()
             
             # Email detection
-            if any(kw in question.lower() for kw in ['email','e-mail','mail']) and '@' in answer:
-                email_from = answer.split('@')[0].strip() + '@' + answer.split('@')[-1].strip()
+            if not email_from and any(keyword in question_lower for keyword in email_keywords):
+                if '@' in answer and '.' in answer.split('@')[-1]:
+                    email_from = answer
             
-            # Contact name detection
-            question_lower = question.lower()
-            if all(kw in question_lower for kw in ['contact', 'one', 'name']):
-                contact_name = answer.strip()
+            # Contact name detection (matches complete phrases first)
+            if not contact_name:
+                if 'contact name one' in question_lower:
+                    contact_name = answer
+                elif 'contact name' in question_lower:
+                    contact_name = answer
+                elif 'first name' in question_lower:
+                    contact_name = answer
+                elif any(keyword in question_lower for keyword in ['contact', 'name', 'one']):
+                    contact_name = answer
             
             table_lines.extend([
                 "<tr>",
-                f"<td style='border:1px solid #ddd; padding:8px;'>{question}</td>",
-                f"<td style='border:1px solid #ddd; padding:8px;'>{answer}</td>",
+                "<td style='border: 1px solid #ddd; padding: 8px;'><strong>%s</strong></td>" % question,
+                "<td style='border: 1px solid #ddd; padding: 8px;'>%s</td>" % answer,
                 "</tr>"
             ])
-
-    # Prepare values
-    lead_email = email_from or (record.partner_id.email if record.partner_id else None)
-    survey_html = "".join(table_lines + ["</table>"])
     
-    # Find matching leads (active or inactive)
-    matching_leads = env['crm.lead'].search([
-        '|', ('email_from', '=ilike', lead_email),
-             ('partner_id.email', '=ilike', lead_email),
-        ('type', '=', 'opportunity')
-    ]) if lead_email else []
-
-    if matching_leads:
-        # Update most recently modified lead
-        main_lead = matching_leads.sorted('write_date', reverse=True)[0]
+    # Close table and div
+    table_lines.extend(["</table>", "</div>"])
+    description = "".join(table_lines)
+    
+    # Fallback to partner email if no email found in survey
+    lead_email = email_from or (record.partner_id.email if record.partner_id and record.partner_id.email else None)
+    
+    # Prepare opportunity name (now includes survey title)
+    opportunity_name = "Opportunity from %s Survey" % survey_title  # Updated to use survey_title
+    if lead_email:
+        opportunity_name = "%s (%s)" % (opportunity_name, lead_email)
+    
+    # Find existing opportunities (excluding won stages)
+    existing_opportunities = env['crm.lead'].search([
+        ('email_from', '=', lead_email),
+        ('type', '=', 'opportunity'),
+        ('stage_id.is_won', '=', False),
+    ]) if lead_email else env['crm.lead'].browse()
+    
+    if existing_opportunities:
+        # Update most recent opportunity
+        main_opportunity = existing_opportunities.sorted(key=lambda l: l.write_date or l.create_date, reverse=True)[0]
+        other_opportunities = existing_opportunities - main_opportunity
         
         update_vals = {
-            'description': f"{main_lead.description or ''}<hr/>{survey_html}",
-            'active': True  # Reactivate if archived
+            'description': "%s<hr/>%s" % (  # Simplified merging
+                main_opportunity.description or "",
+                description  # Already contains survey title and table
+            )
         }
         if contact_name:
             update_vals['contact_name'] = contact_name
-            
-        main_lead.write(update_vals)
         
-        # Log merge activity
-        if len(matching_leads) > 1:
-            main_lead.message_post(
-                body=f"Combined with {len(matching_leads)-1} related opportunities",
-                subject="Survey Response Added"
-            )
+        main_opportunity.write(update_vals)
+        
+        # Handle other opportunities
+        for opp in other_opportunities:
+            env['mail.activity'].search([
+                ('res_id', '=', opp.id),
+                ('res_model', '=', 'crm.lead')
+            ]).write({'res_id': main_opportunity.id})
+            
+            env['mail.message'].search([
+                ('model', '=', 'crm.lead'),
+                ('res_id', '=', opp.id)
+            ]).write({'res_id': main_opportunity.id})
+            
+            opp.write({'active': False})
+        
+        main_opportunity.message_post(body="Merged with %d existing opportunities from %s survey" % (len(other_opportunities), survey_title))
     else:
         # Create new opportunity
         create_vals = {
-            'name': f"{record.survey_id.title} - {lead_email or 'New Lead'}",
-            'description': survey_html,
+            'name': opportunity_name,
+            'description': description,  # Contains survey title and responses
             'email_from': lead_email,
             'type': 'opportunity',
-            'contact_name': contact_name or False
         }
-        env['crm.lead'].create(create_vals)
+        if contact_name:
+            create_vals['contact_name'] = contact_name
+            
+        env['crm.lead'].with_context(
+            mail_create_nolog=True,
+            tracking_disable=True
+        ).create(create_vals)
 
-        ## Powered By HSx Tech
-        ## Ali and Muneeb
+## Powered By HSx Tech
+## Ali and Muneeb
