@@ -25,3 +25,6 @@ for record in records:
         _logger.error(f"Failed creating calendar event for {record.id}: {str(e)}")
         # Continue with next record even if one fails
         continue
+
+##  Powered By HSx Tech
+## AMQ 
